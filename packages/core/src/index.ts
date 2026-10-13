@@ -64,3 +64,17 @@ export function getWorkflow(id: string): Workflow | undefined {
 export function listWorkflows(): Workflow[] {
   return [...workflows.values()];
 }
+
+
+export {
+  runWorkflow,
+  DEFAULT_CONCURRENCY,
+} from "./scheduler.ts";
+
+export type {
+  TaskOutcome,
+  TaskResult,
+  ExecutionSummary,
+  TaskExecutor,
+  RunWorkflowOptions,
+} from "./scheduler.ts";
