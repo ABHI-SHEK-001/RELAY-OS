@@ -78,3 +78,5 @@ export type {
   TaskExecutor,
   RunWorkflowOptions,
 } from "./scheduler.ts";
+
+export { executeAndPersistWorkflow } from "./workflow-runner.ts";
