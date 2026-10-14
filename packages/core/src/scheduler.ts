@@ -1,6 +1,6 @@
-import { getExecutionOrder } from "./dag.js";
-import type { Workflow, WorkflowTask } from "./index.js";
-
+import { getExecutionOrder } from "./dag.ts";
+import type { Workflow, WorkflowTask } from "./index.ts";
+import { EventPersistenceError, type SchedulerEvent, type SchedulerEventRecorder } from "./events.ts";
 /** Terminal outcome of a task within one scheduler run. */
 export type TaskOutcome = "succeeded" | "failed" | "blocked";
 
@@ -44,6 +44,12 @@ export type TaskExecutor<T = unknown> = (task: WorkflowTask) => Promise<T> | T;
 export interface RunWorkflowOptions {
     /** Maximum tasks running at once. Integer >= 1. Default 4. */
     concurrency?: number;
+
+    /** Optional durable event recorder. */
+    recorder?: SchedulerEventRecorder;
+
+    /** Injectable clock for deterministic event timestamps in tests. */
+    now?: () => Date;
 }
 
 export const DEFAULT_CONCURRENCY = 4;
@@ -224,6 +230,38 @@ export async function runWorkflow<T = unknown>(
     let tick = 0;
     let maxObservedConcurrency = 0;
 
+    let eventSequence = 0;
+    let journalFailure: EventPersistenceError | undefined;
+
+    const recordEvent = async (
+        type: SchedulerEvent["type"],
+        taskId: string | null = null,
+        payload: Record<string, unknown> = {},
+    ): Promise<void> => {
+        if (!options.recorder) return;
+
+        if (journalFailure) {
+            throw journalFailure;
+        }
+
+        const event: SchedulerEvent = {
+            workflowId: workflow.id,
+            type,
+            taskId,
+            sequence: ++eventSequence,
+            occurredAt: (options.now ?? (() => new Date()))(),
+            payload,
+        };
+
+        try {
+            await options.recorder.record(event);
+        } catch (cause) {
+            journalFailure = new EventPersistenceError(event, cause);
+            throw journalFailure;
+        }
+    };
+
+
     // Completion queue. Every task promise gets exactly one pair of handlers, attached
     // at launch. The main loop never attaches handlers to task promises; it waits on a
     // single signal that the handlers resolve.
@@ -244,15 +282,13 @@ export async function runWorkflow<T = unknown>(
         });
     };
 
+
     const launch = (task: NormalizedTask): void => {
         startOrder.push(task.id);
         startedAt.set(task.id, tick++);
         running.add(task.id);
         maxObservedConcurrency = Math.max(maxObservedConcurrency, running.size);
 
-        // The executor runs synchronously inside the Promise constructor, so a
-        // synchronous throw becomes a rejection. Both handlers only enqueue and
-        // toError never throws, so this chain cannot produce an unhandled rejection.
         new Promise<T>((resolve) => resolve(execute(task.original))).then(
             (value) => enqueue({ taskId: task.id, ok: true, value }),
             (reason: unknown) => enqueue({ taskId: task.id, ok: false, error: toError(reason) }),
@@ -266,6 +302,7 @@ export async function runWorkflow<T = unknown>(
             startedAt: startedAt.get(settled.taskId)!,
             finishedAt: tick++,
         };
+
         finished.set(
             settled.taskId,
             settled.ok
@@ -279,20 +316,96 @@ export async function runWorkflow<T = unknown>(
         !running.has(task.id) &&
         task.dependencies.every((dep) => finished.get(dep)?.outcome === "succeeded");
 
-    while (true) {
-        // Fill free slots in declared order.
-        for (const task of tasks) {
-            if (running.size >= concurrency) break;
-            if (isStartable(task)) launch(task);
+    // Preserve the original execution path when persistence is not configured.
+    if (!options.recorder) {
+        while (true) {
+            for (const task of tasks) {
+                if (running.size >= concurrency) break;
+                if (isStartable(task)) launch(task);
+            }
+
+            if (running.size === 0) break;
+
+            await waitForCompletion();
+            while (completions.length > 0) record(completions.shift()!);
+        }
+    } else {
+        // Persist the workflow start before any task can execute.
+        await recordEvent("workflow.started", null, {
+            taskCount: tasks.length,
+            concurrency,
+        });
+
+        let persistenceFailed = false;
+
+        while (true) {
+            // Never launch additional work after a journal failure.
+            if (!journalFailure) {
+                for (const task of tasks) {
+                    if (running.size >= concurrency) break;
+                    if (!isStartable(task)) continue;
+
+                    try {
+                        // Write-ahead: a task cannot execute before its start event.
+                        await recordEvent("task.started", task.id, {
+                            dependencies: task.dependencies,
+                        });
+                    } catch {
+                        persistenceFailed = true;
+                        break;
+                    }
+
+                    launch(task);
+                }
+            }
+
+            if (running.size === 0) break;
+
+            await waitForCompletion();
+
+            while (completions.length > 0) {
+                const settled = completions.shift()!;
+                record(settled);
+
+                // Once persistence fails, drain running tasks without further writes.
+                if (journalFailure) {
+                    persistenceFailed = true;
+                    continue;
+                }
+
+                try {
+                    const result = finished.get(settled.taskId)!;
+
+
+                    if (result.outcome === "succeeded") {
+                        await recordEvent("task.succeeded", settled.taskId, {
+                            startedAt: result.startedAt,
+                            finishedAt: result.finishedAt,
+                        });
+                    } else if (result.outcome === "failed") {
+                        await recordEvent("task.failed", settled.taskId, {
+                            startedAt: result.startedAt,
+                            finishedAt: result.finishedAt,
+                            error: result.error.message,
+                        });
+                    } else {
+                        // Blocked tasks are recorded later in the topological-order pass.
+                        continue;
+                    }
+
+                } catch {
+                    persistenceFailed = true;
+                }
+            }
+
+            if (journalFailure) persistenceFailed = true;
         }
 
-        if (running.size === 0) break;
-
-        await waitForCompletion();
-        // Handle everything that has completed so far before refilling, so tasks that
-        // finished together are treated together.
-        while (completions.length > 0) record(completions.shift()!);
+        if (persistenceFailed || journalFailure) {
+            throw journalFailure!;
+        }
     }
+
 
     // Nothing is running and nothing is startable, so every unfinished task has a
     // failed or blocked prerequisite. Resolve them in topological order so each
@@ -310,12 +423,25 @@ export async function runWorkflow<T = unknown>(
         if (roots.size === 0) {
             throw new Error(`Scheduler invariant violated: task "${id}" was neither run nor blocked.`);
         }
-        finished.set(id, { taskId: id, outcome: "blocked", blockedBy: [...roots].sort() });
+        const blockedBy = [...roots].sort();
+
+        if (options.recorder) {
+            await recordEvent("task.blocked", id, { blockedBy });
+        }
+
+        finished.set(id, { taskId: id, outcome: "blocked", blockedBy });
     }
 
     const results = tasks.map((task) => finished.get(task.id)!);
     const counts: Record<TaskOutcome, number> = { succeeded: 0, failed: 0, blocked: 0 };
     for (const result of results) counts[result.outcome]++;
+
+    if (options.recorder) {
+        await recordEvent("workflow.completed", null, {
+            ok: counts.failed === 0 && counts.blocked === 0,
+            counts,
+        });
+    }
 
     return {
         workflowId: workflow.id,
